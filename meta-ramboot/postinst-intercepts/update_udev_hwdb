@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+case "${PREFERRED_PROVIDER_udev}" in
+	systemd)
+		UDEV_EXTRA_ARGS="--usr"
+		UDEVLIBDIR="${rootlibexecdir}"
+		UDEVADM="${base_bindir}/udevadm"
+		;;
+
+	*)
+		UDEV_EXTRA_ARGS=""
+		UDEVLIBDIR="${sysconfdir}"
+		UDEVADM="${bindir}/udevadm"
+		;;
+esac
+
+rm -f $D${UDEVLIBDIR}/udev/hwdb.bin
+
+# Run udevadm. It might skip generation if no hwdb files are present.
+if [ -f "$D${UDEVADM}" ]; then
+    PSEUDO_UNLOAD=1 ${binprefix}qemuwrapper -L $D $D${UDEVADM} hwdb --update --root $D ${UDEV_EXTRA_ARGS} || \
+	PSEUDO_UNLOAD=1 qemuwrapper -L $D $D${UDEVADM} hwdb --update --root $D ${UDEV_EXTRA_ARGS} || true
+fi
+
+# Only chown if the file was actually generated
+if [ -f "$D${UDEVLIBDIR}/udev/hwdb.bin" ]; then
+    chown root:root $D${UDEVLIBDIR}/udev/hwdb.bin
+fi
