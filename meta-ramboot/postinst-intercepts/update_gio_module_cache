@@ -1,0 +1,3 @@
+#!/bin/sh
+# Dummy postinst intercept to prevent GUI/Desktop/Doc compilation overhead in console-only images
+exit 0
