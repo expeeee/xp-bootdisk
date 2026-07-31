@@ -1,57 +1,250 @@
-# Yocto QEMU RAM Booter
+# XP-Bootdisk — Yocto QEMU RAM Booter
 
-This repository contains a custom Yocto Project layer (`meta-ramboot`) designed to build a live USB boot image. The image boots a minimal Linux host that runs entirely in RAM (`tmpfs`), scans for AMD or NVIDIA GPUs, isolates them for VFIO PCI passthrough, and launches a guest OS (Windows 11 or Linux) inside QEMU with native-like performance.
+A custom Yocto Project layer (`meta-ramboot`) that builds a **live USB boot disk**. Boot it on any x86-64 machine with a compatible GPU, and it launches a minimal Linux host entirely from RAM — then runs a full guest OS (Windows 11 or Linux) inside QEMU with near-native performance via KVM and GPU PCI passthrough.
 
-## Repository Structure
+> **No install. No trace. Full hardware.** The host OS lives in RAM; the USB never mounts as writable on the host.
 
-*   [meta-ramboot/](file:///x:/AI/devel/Yocto-bootdisk/meta-ramboot) — Custom Yocto layer housing custom images, systemd services, kernel config fragments, and GPU passthrough/RAM booting scripts.
-*   [docs/yocto-ram-booter.md](file:///x:/AI/devel/Yocto-bootdisk/docs/yocto-ram-booter.md) — Comprehensive guide on system design, host requirements, and compilation/deployment commands.
+---
 
-## Build Setup
+## ✨ Features
 
-To set up and run the build on your Linux compilation server:
+| Feature | Description |
+|---------|-------------|
+| 🧠 **Boots entirely in RAM** | The full host OS decompresses from a `.tar.xz` payload on the USB into `tmpfs` at boot — no HDD required |
+| 🎮 **Dynamic GPU Passthrough** | Automatically detects and isolates AMD or NVIDIA GPUs using VFIO at boot, before any driver claims them |
+| 🕶️ **Hypervisor Stealth** | Hides KVM signature from NVIDIA drivers (`kvm=off`, `hv_vendor_id=null`) to prevent Code 43 errors |
+| 💻 **Windows 11 + Linux Support** | Boots prebuilt `.qcow2` or raw image guests stored as compressed tarballs on the USB data partition |
+| 📀 **Virtual Ventoy Mode** | Drop any bootable `.iso` onto `/media/usb/isos/` and select it from the interactive menu to boot via QEMU |
+| 🌐 **Transparent Bridged Networking** | Guest VM gets a native LAN IP directly from your router; host bridge (`br0`) is fully transparent |
+| 💾 **Remote Persist Trigger** | From inside the guest, hit `http://192.168.254.1:8000/persist` to compress and save changes back to the USB |
+| 🔐 **TPM 2.0 Emulation** | Software TPM (`swtpm`) presented to the guest for Windows 11 compatibility and secure boot scenarios |
+| 🧩 **Modular Yocto Layer** | All customizations live in `meta-ramboot` — easy to extend, add packages, or fork |
 
-1.  **Clone Poky, meta-openembedded, and meta-security dependencies:**
-    ```bash
-    git clone -b scarthgap git://git.yoctoproject.org/poky
-    cd poky
-    git clone -b scarthgap git://git.openembedded.org/meta-openembedded
-    git clone -b scarthgap https://git.yoctoproject.org/meta-security
-    ```
+---
 
-2.  **Clone this repository (`xp-bootdisk`) at the same level, then create a compatibility symlink inside `poky/`:**
-    ```bash
-    git clone https://github.com/expeeee/xp-bootdisk.git
-    cd poky
-    ln -s ../xp-bootdisk yocto-qemu-ramboot
-    ```
+## 🖥️ Host Hardware Requirements
 
-3.  **Initialize the build environment:**
-    ```bash
-    source oe-init-build-env build
-    ```
+| Component | Requirement |
+|-----------|-------------|
+| **CPU** | x86-64 with KVM (`vmx`/`svm`) and IOMMU (`VT-d`/`AMD-Vi`) enabled in BIOS |
+| **RAM** | 32 GB minimum (16 GB for host OS in RAM + 16 GB for guest). 64 GB recommended for Windows 11 |
+| **GPU** | Discrete AMD (RDNA2+) or NVIDIA (Pascal+) in its own IOMMU group |
+| **USB Drive** | USB 3.0+, 32 GB minimum. USB 3.1 Gen 2 or NVMe in USB enclosure recommended |
+| **Firmware** | UEFI firmware. Secure Boot must be **disabled** |
+| **Network** | Ethernet NIC (Wi-Fi bridging not supported) |
 
-4.  **Add the layers to `conf/bblayers.conf`:**
-    ```bitbake
-    BBLAYERS ?= " \
-      ${TOPDIR}/../meta \
-      ${TOPDIR}/../meta-poky \
-      ${TOPDIR}/../meta-yocto-bsp \
-      ${TOPDIR}/../meta-openembedded/meta-oe \
-      ${TOPDIR}/../meta-openembedded/meta-python \
-      ${TOPDIR}/../meta-security \
-      ${TOPDIR}/../meta-security/meta-tpm \
-      ${TOPDIR}/../yocto-qemu-ramboot/meta-ramboot \
-      "
-    ```
+> ℹ️ **IOMMU group isolation** is critical. If your GPU shares an IOMMU group with other devices (common on consumer B-series motherboards), ACS override patches or an X-series/HEDT platform may be needed.
 
-5.  **Compile the image:**
-    ```bash
-    bitbake ramboot-image
-    ```
+---
 
-Once flashed to a USB key, create the following folders on the data partition:
-*   `/payloads/` — for prebuilt system tarballs (`win11.tar.xz`, `linux.tar.xz`).
-*   `/isos/` — for raw bootable installer/live `.iso` files (Virtual Ventoy mode).
+## 🚀 Quick Start
 
-For detailed configuration steps, system requirements, and post-build USB installation guidelines, check the detailed documentation at [docs/yocto-ram-booter.md](file:///x:/AI/devel/Yocto-bootdisk/docs/yocto-ram-booter.md).
+Use the included `setup.sh` to handle the full environment setup automatically:
+
+```bash
+# 1. Clone Poky and dependencies into the same parent directory
+git clone -b scarthgap git://git.yoctoproject.org/poky
+cd poky
+git clone -b scarthgap git://git.openembedded.org/meta-openembedded
+git clone -b scarthgap https://git.yoctoproject.org/meta-security
+
+# 2. Clone this repository at the same level as poky/
+cd ..
+git clone https://github.com/expeeee/xp-bootdisk.git
+
+# 3. Run the automated setup and build
+cd xp-bootdisk
+./setup.sh
+```
+
+`setup.sh` will:
+- Verify Poky is present and create the required compatibility symlink
+- Initialize the BitBake build environment
+- Start `bitbake ramboot-image` automatically
+
+---
+
+## 📁 Repository Structure
+
+```
+xp-bootdisk/
+├── meta-ramboot/                  # Custom Yocto layer
+│   ├── conf/layer.conf
+│   ├── postinst-intercepts/       # Custom intercepts for console-only image
+│   ├── recipes-core/
+│   │   ├── images/
+│   │   │   └── ramboot-image.bb   # Main image recipe
+│   │   ├── ovmf/
+│   │   │   └── ovmf_%.bbappend    # UEFI firmware packaging
+│   │   └── qemu-booter/
+│   │       ├── qemu-booter.bb     # Boot helper package
+│   │       └── files/
+│   │           ├── qemu-booter.sh        # Interactive launcher
+│   │           ├── bind-gpu.sh           # Dynamic VFIO GPU isolator
+│   │           ├── persist-server.py     # Host HTTP persist daemon
+│   │           ├── 25-bridge.netdev      # Bridge interface definition
+│   │           ├── 25-bridge.network     # Bridge physical member config
+│   │           ├── 25-bridge-dhcp.network # Bridge DHCP + static alias
+│   │           ├── qemu-ifup             # TAP bridge attach hook
+│   │           └── qemu-ifdown           # TAP bridge detach hook
+│   └── recipes-kernel/
+│       └── linux/
+│           ├── linux-yocto_%.bbappend
+│           └── files/vfio.cfg            # VFIO kernel config fragment
+├── docs/
+│   └── yocto-ram-booter.md        # Detailed architecture & config guide
+├── setup.sh                       # One-command build bootstrapper
+├── deploy.sh                      # Interactive USB flasher
+└── README.md
+```
+
+---
+
+## ⚙️ How It Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        USB Drive                             │
+│  Partition 1: Yocto OS Image (WIC/ISO, UEFI bootable)       │
+│  Partition 2: exFAT Data (XP-BOOTDATA)                      │
+│    ├── /payloads/win11.tar.xz   ← compressed QCOW2 image    │
+│    ├── /payloads/linux.tar.xz   ← compressed raw image      │
+│    └── /isos/ubuntu-24.04.iso   ← Virtual Ventoy ISO        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                    Machine boots from USB
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Yocto Linux Host (in RAM — tmpfs)                          │
+│                                                              │
+│  1. Systemd starts qemu-booter.sh on tty1                   │
+│  2. User selects: OS payload, ISO boot, or GPU passthrough  │
+│  3. bind-gpu.sh scans PCI bus, isolates GPU → vfio-pci      │
+│  4. Payload .tar.xz decompresses into /tmp/guest/ (RAM)     │
+│  5. persist-server.py starts on 192.168.254.1:8000          │
+│  6. QEMU launches with KVM + VFIO + TAP networking          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                    Guest OS boots at native speed
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Guest OS (Windows 11 / Linux) — full hardware access       │
+│  • Direct GPU via VFIO passthrough                          │
+│  • Native LAN IP via bridged TAP interface                  │
+│  • Software TPM 2.0 (swtpm)                                 │
+│  • Access host persist server at 192.168.254.1:8000         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🌐 Networking
+
+The host creates a **transparent bridge** (`br0`) at boot using `systemd-networkd`:
+
+- All physical Ethernet interfaces (`en*`, `eth*`) are enslaved to `br0`
+- `br0` acquires an IP via DHCP from your router — the guest gets its own native LAN IP
+- A **private control subnet** `192.168.254.0/24` is also assigned to `br0`:
+  - Host listens at `192.168.254.1`
+  - Guest should be configured with `192.168.254.2` as a secondary/alias IP
+
+### Configuring the Guest Secondary IP
+
+| Guest OS | Command |
+|----------|---------|
+| **Windows** | Network Adapter → IPv4 Properties → Advanced → Add `192.168.254.2 / 255.255.255.0` |
+| **Linux** | `sudo ip addr add 192.168.254.2/24 dev eth0` |
+| **macOS** | `sudo ifconfig en0 alias 192.168.254.2 255.255.255.0` |
+
+---
+
+## 💾 Persist Server — Saving Guest Changes
+
+Changes made inside the guest VM live in RAM by default. To save them back to the USB key:
+
+### Option 1 — Shut down the guest normally
+When QEMU exits, the launcher prompts:
+> `Would you like to compress and persist changes back to the USB drive? [y/N]`
+
+Selecting `y` re-compresses the RAM disk back into `.tar.xz` and writes it to the USB.
+
+### Option 2 — Remote web trigger (headless)
+From inside the guest OS, simply access:
+```
+http://192.168.254.1:8000/persist
+```
+This instructs the host daemon (`persist-server.py`) to:
+1. Send an ACPI shutdown (`system_powerdown`) via the QEMU monitor socket
+2. Wait for the guest to exit cleanly
+3. Compress the RAM disk image back to the USB payload
+4. Power off the physical host
+
+Works from any browser, `curl`, or application inside the guest on any OS.
+
+---
+
+## 📀 Virtual Ventoy Mode — Booting ISOs
+
+Drop any standard bootable `.iso` file onto the USB data partition:
+
+```bash
+# After deploy.sh, the partition is mounted at /media/usb on the host
+cp ubuntu-24.04-desktop.iso /media/usb/isos/
+cp Win11_23H2_x64.iso       /media/usb/isos/
+```
+
+At boot, the interactive menu will display all detected ISOs. Select one to boot it inside QEMU with optional temporary disk allocation in RAM for installation or testing.
+
+---
+
+## 🔌 USB Deployment
+
+Use the included `deploy.sh` script to safely flash and prepare a USB drive:
+
+```bash
+./deploy.sh
+```
+
+The script will:
+1. List all attached USB block devices (never shows internal drives)
+2. Prompt for confirmation before any write
+3. Flash `ramboot-image-qemux86-64.rootfs.wic.gz` to Partition 1
+4. Format the remaining space as **exFAT** (label: `XP-BOOTDATA`)
+5. Create `/payloads/` and `/isos/` directories on the data partition
+
+> ⚠️ Double-check the target device path. `deploy.sh` includes safety filters but cannot prevent all user error.
+
+---
+
+## ⚠️ Known Limitations
+
+- **Secure Boot must be disabled** — the kernel is unsigned
+- **IOMMU group isolation** — the GPU must be in its own IOMMU group. Shared groups (ACS issue) require BIOS/motherboard workarounds
+- **Wi-Fi bridging not supported** — the transparent bridge requires a wired Ethernet interface
+- **Single GPU passthrough** — one discrete GPU is passed to the guest; the host console uses only framebuffer or a second GPU
+- **USB 3.0+ strongly recommended** — USB 2.0 drives will be too slow for decompressing payloads into RAM
+- **No Wayland on host** — the host is a minimal console-only environment (by design)
+
+---
+
+## 🛠️ Development & Extension
+
+To rebuild after changing layer recipes:
+
+```bash
+./setup.sh          # Re-runs bitbake ramboot-image
+```
+
+To add packages to the image, edit [`meta-ramboot/recipes-core/images/ramboot-image.bb`](file:///x:/AI/devel/Yocto-bootdisk/meta-ramboot/recipes-core/images/ramboot-image.bb) and add entries to `IMAGE_INSTALL`.
+
+To change kernel config, edit [`meta-ramboot/recipes-kernel/linux/files/vfio.cfg`](file:///x:/AI/devel/Yocto-bootdisk/meta-ramboot/recipes-kernel/linux/files/vfio.cfg) and bump `PR` in the `.bbappend`.
+
+For full architecture details, configuration options, and advanced scenarios, see [`docs/yocto-ram-booter.md`](file:///x:/AI/devel/Yocto-bootdisk/docs/yocto-ram-booter.md).
+
+---
+
+## 📄 License
+
+This project and `meta-ramboot` layer are released under the MIT License. Yocto Project components retain their respective upstream licenses.
