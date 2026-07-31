@@ -1,0 +1,6 @@
+[Match]
+Name=br0
+
+[Network]
+DHCP=yes
+Address=192.168.254.1/24

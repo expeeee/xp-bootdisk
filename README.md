@@ -19,9 +19,11 @@ To set up and run the build on your Linux compilation server:
     git clone -b scarthgap https://git.yoctoproject.org/meta-security
     ```
 
-2.  **Pull this repository (`yocto-qemu-ramboot`) into the poky folder:**
+2.  **Clone this repository (`xp-bootdisk`) at the same level, then create a compatibility symlink inside `poky/`:**
     ```bash
-    git clone <your-repo-url>
+    git clone https://github.com/expeeee/xp-bootdisk.git
+    cd poky
+    ln -s ../xp-bootdisk yocto-qemu-ramboot
     ```
 
 3.  **Initialize the build environment:**

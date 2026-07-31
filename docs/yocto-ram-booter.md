@@ -108,3 +108,35 @@ Create a second partition on the USB drive (or use an external USB drive) mounte
     *   `win11.tar.xz` (containing `win11.qcow2` to run Windows 11 LTSC)
     *   `linux.tar.xz` (containing `linux.img` to run Linux)
 *   **/media/usb/isos/** — Place any standard bootable installer or live ISO images here (e.g., `ubuntu-24.04-desktop.iso`, `Windows11_Install.iso`). The loader will dynamically scan, display, and boot them in **Virtual Ventoy** mode (with optional temporary target disks in RAM).
+
+---
+
+## Transparent Bridged Networking Setup
+
+The host OS automatically creates a bridge interface `br0` and binds the physical LAN interface (`en*` / `eth*`) to it. DHCP runs directly on `br0`, allowing the guest VM to receive a native LAN IP from the router DHCP server.
+
+To communicate with the host's background daemon while maintaining transparent bridge access:
+1. The host binds a secondary static IP of `192.168.254.1/24` to `br0`.
+2. Inside your guest OS, assign a secondary/alias IP of `192.168.254.2` with subnet mask `255.255.255.0` to the network adapter.
+   * **Windows Guest:** Open advanced IPv4 network adapter properties and add `192.168.254.2` to the list of IP addresses.
+   * **Linux Guest:** Run `sudo ip addr add 192.168.254.2/24 dev eth0` (or setup netplan alias).
+   * **macOS Guest:** Add an alias interface: `sudo ifconfig en0 alias 192.168.254.2 255.255.255.0`.
+
+---
+
+## VM Recapture and Auto-Persist Server
+
+To persist any software changes or system configurations made inside your RAM-backed guest VM back to the USB drive:
+
+### 1. Manual / Console Trigger
+When you shut down the guest OS cleanly from the OS menu:
+* The VM exits and returns control to the host console.
+* The launcher displays a prompt: `Would you like to compress and persist changes back to the USB drive?`
+* Selecting **Yes** will automatically package and overwrite the `.tar.xz` file on the USB.
+
+### 2. Remote / Web Trigger
+If you run the VM headlessly, or want to trigger the persist operation remotely:
+1. Enter the guest VM and browse or fetch the URL: `http://192.168.254.1:8000/persist`
+2. The host's background server receives the trigger, schedules a state backup, and sends a safe ACPI shutdown command (`system_powerdown`) to the VM.
+3. The guest OS flushes file writes and exits cleanly.
+4. The host intercepts the exit, compresses the RAM disk image back to the USB payloads folder, and powers down the physical machine automatically.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Seamless QEMU Payload Extractor & Launcher
+# Seamless QEMU Payload Extractor & Launcher with Auto-Persist & Bridging
 
 set -e
 
@@ -20,6 +20,15 @@ if ! mountpoint -q "$RAMDISK"; then
     mount -t tmpfs -o size=80% tmpfs "$RAMDISK"
 fi
 
+# Clean up old trigger files & sockets
+rm -f /tmp/auto_persist /tmp/qemu-monitor.sock
+
+# Start background persist HTTP server
+if [ -f "/usr/bin/persist-server" ]; then
+    /usr/bin/persist-server &
+    SERVER_PID=$!
+fi
+
 clear
 
 CHOICE=$(dialog --backtitle "HYPERVISOR BOOT MANAGER" \
@@ -35,6 +44,9 @@ clear
 
 if [ "$CHOICE" == "4" ] || [ -z "$CHOICE" ]; then
     echo "Exiting hypervisor launcher..."
+    if [ -n "$SERVER_PID" ]; then
+        kill $SERVER_PID 2>/dev/null || true
+    fi
     setterm -cursor on 2>/dev/null || true
     exit 0
 fi
@@ -54,6 +66,10 @@ fi
 
 clear
 
+# Common QEMU arguments
+NET_ARGS="-netdev tap,id=net0,ifname=tap0,script=/etc/qemu-ifup,downscript=/etc/qemu-ifdown -device virtio-net-pci,netdev=net0"
+MONITOR_ARGS="-monitor unix:/tmp/qemu-monitor.sock,server,nowait"
+
 case $CHOICE in
     1)
         ARCHIVE="$PAYLOAD_DIR/win11.tar.xz"
@@ -62,6 +78,7 @@ case $CHOICE in
         if [ ! -f "$ARCHIVE" ]; then
             echo "[!] Error: Win11 payload not found at $ARCHIVE"
             read -p "Press Enter to return..."
+            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
             exit 1
         fi
         
@@ -97,7 +114,8 @@ case $CHOICE in
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
             -device tpm-tis,tpmdev=tpm0 \
             -drive file="$IMG",format=qcow2,if=virtio,aio=io_uring \
-            -net nic,model=virtio -net user \
+            $NET_ARGS \
+            $MONITOR_ARGS \
             $GPU_PASSTHROUGH_ARGS
             
         kill $SWTPM_PID 2>/dev/null || true
@@ -110,6 +128,7 @@ case $CHOICE in
         if [ ! -f "$ARCHIVE" ]; then
             echo "[!] Error: Linux payload not found at $ARCHIVE"
             read -p "Press Enter to return..."
+            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
             exit 1
         fi
         
@@ -129,7 +148,8 @@ case $CHOICE in
             -m 16G -smp 8 \
             -cpu "$CPU_ARGS" \
             -drive file="$IMG",format=raw,if=virtio,aio=io_uring \
-            -net nic,model=virtio -net user \
+            $NET_ARGS \
+            $MONITOR_ARGS \
             $GPU_PASSTHROUGH_ARGS
         ;;
 
@@ -150,6 +170,7 @@ case $CHOICE in
         
         if [ ${#ISO_MENU[@]} -eq 0 ]; then
             dialog --title "No ISOs Found" --msgbox "Please place bootable .iso files in $ISO_DIR" 6 50
+            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
             exit 1
         fi
         
@@ -161,6 +182,7 @@ case $CHOICE in
             
         if [ -z "$ISO_CHOICE" ]; then
             echo "No ISO selected. Exiting..."
+            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
             exit 0
         fi
         
@@ -195,11 +217,53 @@ case $CHOICE in
             -drive file="$SELECTED_ISO",media=cdrom,readonly=on \
             -boot d \
             $ATTACH_DISK \
-            -net nic,model=virtio -net user \
+            $NET_ARGS \
+            $MONITOR_ARGS \
             $GPU_PASSTHROUGH_ARGS
         ;;
 esac
 
-echo "[+] Guest VM terminated. Cleaning up RAM disk..."
+# Kill HTTP server daemon
+if [ -n "$SERVER_PID" ]; then
+    kill $SERVER_PID 2>/dev/null || true
+fi
+
+# Determine whether to save changes
+RUN_PERSIST=0
+if [ -f "/tmp/auto_persist" ]; then
+    RUN_PERSIST=1
+    rm -f "/tmp/auto_persist"
+    echo "[+] Auto-persist triggered by guest VM."
+else
+    clear
+    # Check if console environment is present and query the user
+    if dialog --backtitle "PERSIST CHANGES" --yesno "Would you like to compress and persist changes back to the USB drive?" 7 60; then
+        RUN_PERSIST=1
+    fi
+fi
+
+if [ "$RUN_PERSIST" -eq 1 ]; then
+    echo "[+] Persisting changes to USB drive... Please do not unplug the drive."
+    case $CHOICE in
+        1)
+            echo "[+] Compressing Windows 11 image back to USB payloads (this may take a few minutes)..."
+            tar -cJf "$PAYLOAD_DIR/win11.tar.xz" -C "$RAMDISK" win11.qcow2
+            ;;
+        2)
+            echo "[+] Compressing Linux image back to USB payloads (this may take a few minutes)..."
+            tar -cJf "$PAYLOAD_DIR/linux.tar.xz" -C "$RAMDISK" linux.img
+            ;;
+        3)
+            if [ -f "$RAMDISK/temp_target.qcow2" ]; then
+                echo "[+] Compressing Virtual Ventoy installation disk back to USB payloads..."
+                tar -cJf "$PAYLOAD_DIR/ventoy_install.tar.xz" -C "$RAMDISK" temp_target.qcow2
+            fi
+            ;;
+    esac
+    echo "[+] Persist complete."
+    sleep 2
+fi
+
+echo "[+] Cleaning up RAM disk..."
 umount "$RAMDISK" || true
-setterm -cursor on 2>/dev/null || true\n
+setterm -cursor on 2>/dev/null || true
