@@ -14,6 +14,7 @@ A custom Yocto Project layer (`meta-ramboot`) that builds a **live USB boot disk
 | 🎮 **Dynamic GPU Passthrough** | Automatically detects and isolates AMD or NVIDIA GPUs using VFIO at boot, before any driver claims them |
 | 🕶️ **Hypervisor Stealth** | Hides KVM signature from NVIDIA drivers (`kvm=off`, `hv_vendor_id=null`) to prevent Code 43 errors |
 | 💻 **Windows 11 + Linux Support** | Boots prebuilt `.qcow2` or raw image guests stored as compressed tarballs on the USB data partition |
+| 🍎 **macOS Support** | Boots macOS Sonoma/Sequoia via OpenCore EFI with Intel CPU spoofing, Apple SMC emulation, and optional AMD GPU passthrough |
 | 📀 **Virtual Ventoy Mode** | Drop any bootable `.iso` onto `/media/usb/isos/` and select it from the interactive menu to boot via QEMU |
 | 🌐 **Transparent Bridged Networking** | Guest VM gets a native LAN IP directly from your router; host bridge (`br0`) is fully transparent |
 | 💾 **Remote Persist Trigger** | From inside the guest, hit `http://192.168.254.1:8000/persist` to compress and save changes back to the USB |
@@ -197,6 +198,7 @@ cp Win11_23H2_x64.iso       /media/usb/isos/
 
 At boot, the interactive menu will display all detected ISOs. Select one to boot it inside QEMU with optional temporary disk allocation in RAM for installation or testing.
 
+
 ---
 
 ## 🔌 USB Deployment
@@ -216,6 +218,28 @@ The script will:
 
 > ⚠️ Double-check the target device path. `deploy.sh` includes safety filters but cannot prevent all user error.
 
+### USB Payload Setup
+
+After flashing, place your guest OS payloads on the `XP-BOOTDATA` partition:
+
+```
+/payloads/
+├── win11.tar.xz     ← Windows 11 LTSC QCOW2 image
+├── linux.tar.xz     ← Linux raw disk image
+└── macos.tar.xz     ← macOS (OpenCore + OVMF + BaseSystem + HDD disk)
+/isos/
+├── ubuntu-24.04.iso
+└── Win11_23H2.iso
+```
+
+To prepare the macOS payload, run:
+```bash
+./fetch-macos-payload.sh [sonoma|ventura|sequoia]
+cp macos.tar.xz /media/usb/payloads/
+```
+
+See [`docs/macos-setup.md`](file:///x:/AI/devel/Yocto-bootdisk/docs/macos-setup.md) for full macOS setup instructions.
+
 ---
 
 ## ⚠️ Known Limitations
@@ -226,6 +250,7 @@ The script will:
 - **Single GPU passthrough** — one discrete GPU is passed to the guest; the host console uses only framebuffer or a second GPU
 - **USB 3.0+ strongly recommended** — USB 2.0 drives will be too slow for decompressing payloads into RAM
 - **No Wayland on host** — the host is a minimal console-only environment (by design)
+- **macOS: AMD GPU only** — NVIDIA support was dropped by Apple after High Sierra; only AMD RX/Vega/Pro GPUs work natively in macOS Sonoma/Sequoia
 
 ---
 

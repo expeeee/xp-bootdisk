@@ -13,6 +13,16 @@ SWTPM_DIR="/tmp/swtpm"
 OVMF_CODE="/usr/share/ovmf/OVMF_CODE.fd"
 OVMF_VARS_TEMPLATE="/usr/share/ovmf/OVMF_VARS.fd"
 
+# macOS-specific paths (inside extracted macos payload)
+MACOS_OVMF_CODE="$RAMDISK/ovmf/OVMF_CODE.fd"
+MACOS_OVMF_VARS_TEMPLATE="$RAMDISK/ovmf/OVMF_VARS-macos.fd"
+MACOS_OPENCORE="$RAMDISK/opencore/OpenCore.qcow2"
+MACOS_RECOVERY="$RAMDISK/BaseSystem.img"
+MACOS_HDD="$RAMDISK/mac_hdd_ng.qcow2"
+
+# Apple SMC key (required for macOS boot — from OSX-KVM project)
+APPLE_OSK="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
+
 mkdir -p "$RAMDISK" "$ISO_DIR"
 
 # Mount tmpfs using 80% of host RAM
@@ -33,16 +43,17 @@ clear
 
 CHOICE=$(dialog --backtitle "HYPERVISOR BOOT MANAGER" \
     --title " Select Target Operating System " \
-    --menu "Choose an OS payload to extract into RAM and launch:" 15 60 4 \
+    --menu "Choose an OS payload to extract into RAM and launch:" 17 65 6 \
     1 "Windows 11 LTSC (TPM 2.0 + UEFI)" \
     2 "Linux OS (Native Live Image)" \
-    3 "Boot ISO (Virtual Ventoy)" \
-    4 "Exit to Shell" \
+    3 "macOS (OpenCore + VFIO GPU recommended)" \
+    4 "Boot ISO (Virtual Ventoy)" \
+    5 "Exit to Shell" \
     3>&1 1>&2 2>&3)
 
 clear
 
-if [ "$CHOICE" == "4" ] || [ -z "$CHOICE" ]; then
+if [ "$CHOICE" == "5" ] || [ -z "$CHOICE" ]; then
     echo "Exiting hypervisor launcher..."
     if [ -n "$SERVER_PID" ]; then
         kill $SERVER_PID 2>/dev/null || true
@@ -68,6 +79,8 @@ clear
 
 # Common QEMU arguments
 NET_ARGS="-netdev tap,id=net0,ifname=tap0,script=/etc/qemu-ifup,downscript=/etc/qemu-ifdown -device virtio-net-pci,netdev=net0"
+# macOS needs vmxnet3 NIC for best compatibility
+MAC_NET_ARGS="-netdev tap,id=net0,ifname=tap0,script=/etc/qemu-ifup,downscript=/etc/qemu-ifdown -device vmxnet3,netdev=net0,id=net0,mac=52:54:00:09:49:17"
 MONITOR_ARGS="-monitor unix:/tmp/qemu-monitor.sock,server,nowait"
 
 case $CHOICE in
@@ -154,6 +167,65 @@ case $CHOICE in
         ;;
 
     3)
+        # ── macOS via OpenCore ──────────────────────────────────────────────
+        ARCHIVE="$PAYLOAD_DIR/macos.tar.xz"
+
+        if [ ! -f "$ARCHIVE" ]; then
+            dialog --title "Payload Missing" --msgbox "macOS payload not found at $ARCHIVE\n\nRun fetch-macos-payload.sh on a Linux machine to create it." 8 65
+            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
+            exit 1
+        fi
+
+        echo "[+] Decompressing macOS payload into RAM disk..."
+        tar -xJf "$ARCHIVE" -C "$RAMDISK"
+
+        # Ensure KVM MSR ignore is set (required for macOS)
+        echo 1 > /sys/module/kvm/parameters/ignore_msrs 2>/dev/null || true
+
+        echo "[+] Preparing macOS OVMF NVRAM (writable copy)..."
+        cp "$MACOS_OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS-macos-run.fd"
+
+        # macOS must use Haswell-noTSX (AVX2) with Intel vendor spoof
+        MAC_CPU_ARGS="Haswell-noTSX,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,check"
+
+        # macOS GPU passthrough: replace software VGA with VFIO args if user selected GPU
+        if echo "$GPU_PASSTHROUGH_ARGS" | grep -q "vfio-pci"; then
+            MAC_GPU_ARGS="-vga none -display none $PASSTHROUGH_CMD_ARGS"
+        else
+            # macOS cannot use virtio-vga; fall back to vmware SVGA for software rendering
+            MAC_GPU_ARGS="-vga vmware -display default,show-cursor=on"
+        fi
+
+        echo "[+] Booting macOS in RAM via OpenCore..."
+        qemu-system-x86_64 \
+            -enable-kvm \
+            -m 8G \
+            -cpu "$MAC_CPU_ARGS" \
+            -machine q35 \
+            -smp 8,sockets=1,cores=4,threads=2 \
+            -device usb-ehci,id=ehci \
+            -device qemu-xhci,id=xhci \
+            -device usb-kbd,bus=xhci.0 \
+            -device usb-tablet,bus=xhci.0 \
+            -device isa-applesmc,osk="$APPLE_OSK" \
+            -drive if=pflash,format=raw,readonly=on,file="$MACOS_OVMF_CODE" \
+            -drive if=pflash,format=raw,file="$RAMDISK/OVMF_VARS-macos-run.fd" \
+            -smbios type=2 \
+            -device ich9-intel-hda \
+            -device hda-duplex \
+            -device ich9-ahci,id=sata \
+            -drive id=OpenCoreBoot,if=none,snapshot=on,format=qcow2,file="$MACOS_OPENCORE" \
+            -device ide-hd,bus=sata.2,drive=OpenCoreBoot \
+            -drive id=InstallMedia,if=none,file="$MACOS_RECOVERY",format=raw \
+            -device ide-hd,bus=sata.3,drive=InstallMedia \
+            -drive id=MacHDD,if=none,file="$MACOS_HDD",format=qcow2 \
+            -device ide-hd,bus=sata.4,drive=MacHDD \
+            $MAC_NET_ARGS \
+            $MONITOR_ARGS \
+            $MAC_GPU_ARGS
+        ;;
+
+    4)
         # Scan directory for ISOs
         declare -a ISO_MENU
         declare -A ISO_MAP
@@ -223,6 +295,8 @@ case $CHOICE in
         ;;
 esac
 
+# Reassign ISO Ventoy to case 4 (menu item renumbered from 3 to 4)
+
 # Kill HTTP server daemon
 if [ -n "$SERVER_PID" ]; then
     kill $SERVER_PID 2>/dev/null || true
@@ -254,6 +328,16 @@ if [ "$RUN_PERSIST" -eq 1 ]; then
             tar -cJf "$PAYLOAD_DIR/linux.tar.xz" -C "$RAMDISK" linux.img
             ;;
         3)
+            echo "[+] Compressing macOS HDD image back to USB payloads (this may take several minutes)..."
+            # Repackage all macOS components back — preserves OpenCore EFI and OVMF changes
+            tar -cJf "$PAYLOAD_DIR/macos.tar.xz" \
+                -C "$RAMDISK" \
+                mac_hdd_ng.qcow2 \
+                BaseSystem.img \
+                opencore/ \
+                ovmf/
+            ;;
+        4)
             if [ -f "$RAMDISK/temp_target.qcow2" ]; then
                 echo "[+] Compressing Virtual Ventoy installation disk back to USB payloads..."
                 tar -cJf "$PAYLOAD_DIR/ventoy_install.tar.xz" -C "$RAMDISK" temp_target.qcow2

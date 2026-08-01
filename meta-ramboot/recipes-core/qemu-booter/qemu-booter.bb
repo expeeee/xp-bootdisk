@@ -12,6 +12,7 @@ SRC_URI = " \
     file://qemu-ifup \
     file://qemu-ifdown \
     file://persist-server.py \
+    file://kvm-macos.conf \
 "
 
 S = "${WORKDIR}"
@@ -34,6 +35,7 @@ RDEPENDS:${PN} = " \
     swtpm \
     python3-core \
     python3-netserver \
+    dmg2img \
 "
 
 do_install() {
@@ -55,4 +57,8 @@ do_install() {
     install -d ${D}${sysconfdir}
     install -m 0755 ${WORKDIR}/qemu-ifup ${D}${sysconfdir}/qemu-ifup
     install -m 0755 ${WORKDIR}/qemu-ifdown ${D}${sysconfdir}/qemu-ifdown
+
+    # Install KVM module config for macOS MSR compatibility
+    install -d ${D}${sysconfdir}/modprobe.d
+    install -m 0644 ${WORKDIR}/kvm-macos.conf ${D}${sysconfdir}/modprobe.d/kvm-macos.conf
 }
