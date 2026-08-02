@@ -37,7 +37,6 @@ RDEPENDS:${PN} = " \
     kmod \
     python3-core \
     python3-netserver \
-    dmg2img \
 "
 
 do_install() {
