@@ -68,3 +68,8 @@ do_install() {
 }
 
 FILES:${PN} += "/media/usb"
+
+# /media/usb is intentionally empty at install time (runtime mount point)
+
+# /media/usb is intentionally empty at install time
+INSANE_SKIP:${PN} += "empty-dirs"
