@@ -1,0 +1,8 @@
+# short-description: Create a GPT/UEFI ramboot host disk image
+# long-description: Creates an EFI System Partition and an ext4 host root
+# filesystem. deploy.sh appends the XP-BOOTDATA exFAT partition after flashing.
+
+part /boot --source bootimg-efi --sourceparams="loader=systemd-boot" --ondisk sda --label ESP --active --align 1024 --use-uuid
+part / --source rootfs --ondisk sda --fstype=ext4 --label RAMBOOT-HOST --align 1024 --use-uuid
+
+bootloader --ptable gpt --timeout=3 --append="rootwait rootfstype=ext4 console=tty0 console=ttyS0,115200"

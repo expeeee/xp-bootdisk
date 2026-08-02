@@ -2,7 +2,11 @@ SUMMARY = "Seamless QEMU Dynamic GPU Passthrough & RAM-Boot Host Image"
 DESCRIPTION = "A lightweight Yocto Linux live host image designed to extract OS payloads into RAM and boot them seamlessly via QEMU and VFIO passthrough."
 LICENSE = "MIT"
 
-IMAGE_FEATURES += "splash ssh-server-openssh"
+# The host bridge is directly reachable from the LAN. Remote administration is
+# intentionally opt-in; never ship development passwords in the production image.
+IMAGE_FEATURES += "splash"
+IMAGE_FEATURES:remove = "debug-tweaks ssh-server-openssh"
+EXTRA_IMAGE_FEATURES:remove = "debug-tweaks"
 
 IMAGE_INSTALL = " \
     packagegroup-core-boot \
@@ -26,5 +30,8 @@ IMAGE_INSTALL = " \
 "
 
 IMAGE_FSTYPES = "wic wic.gz iso"
+WKS_FILE = "ramboot-uefi.wks"
+EFI_PROVIDER = "systemd-boot"
+MACHINE_FEATURES:append = " efi"
 
 inherit core-image

@@ -1,6 +1,8 @@
 [Unit]
 Description=Seamless QEMU RAM-Boot & VFIO Passthrough Manager
-After=multi-user.target
+Requires=media-usb.mount
+After=media-usb.mount network-online.target
+Wants=network-online.target
 Conflicts=getty@tty1.service
 
 [Service]
@@ -10,6 +12,7 @@ StandardInput=tty
 StandardOutput=tty
 ExecStart=/usr/bin/qemu-booter
 Restart=no
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

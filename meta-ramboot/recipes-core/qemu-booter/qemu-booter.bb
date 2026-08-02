@@ -6,6 +6,7 @@ SRC_URI = " \
     file://qemu-booter.sh \
     file://bind-gpu.sh \
     file://qemu-booter.service \
+    file://media-usb.mount \
     file://25-bridge.netdev \
     file://25-bridge.network \
     file://25-bridge-dhcp.network \
@@ -19,7 +20,7 @@ S = "${WORKDIR}"
 
 inherit systemd
 
-SYSTEMD_SERVICE:${PN} = "qemu-booter.service"
+SYSTEMD_SERVICE:${PN} = "media-usb.mount qemu-booter.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
 RDEPENDS:${PN} = " \
@@ -33,6 +34,7 @@ RDEPENDS:${PN} = " \
     pciutils \
     ovmf \
     swtpm \
+    kmod \
     python3-core \
     python3-netserver \
     dmg2img \
@@ -46,6 +48,9 @@ do_install() {
 
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${WORKDIR}/qemu-booter.service ${D}${systemd_system_unitdir}/
+    install -m 0644 ${WORKDIR}/media-usb.mount ${D}${systemd_system_unitdir}/
+
+    install -d ${D}/media/usb
 
     # Install systemd-networkd configurations
     install -d ${D}${sysconfdir}/systemd/network
@@ -62,3 +67,5 @@ do_install() {
     install -d ${D}${sysconfdir}/modprobe.d
     install -m 0644 ${WORKDIR}/kvm-macos.conf ${D}${sysconfdir}/modprobe.d/kvm-macos.conf
 }
+
+FILES:${PN} += "/media/usb"

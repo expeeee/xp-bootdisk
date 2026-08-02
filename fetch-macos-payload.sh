@@ -109,7 +109,7 @@ log "  opencore/OpenCore.qcow2"
 log "  ovmf/OVMF_CODE.fd + OVMF_VARS-macos.fd"
 
 PAYLOAD_ARCHIVE="${OUTPUT_DIR}/../macos.tar.xz"
-tar -cJf "$PAYLOAD_ARCHIVE" \
+tar --sparse -cJf "$PAYLOAD_ARCHIVE" \
     --transform "s|^\./||" \
     ./mac_hdd_ng.qcow2 \
     ./BaseSystem.img \

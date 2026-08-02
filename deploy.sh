@@ -1,129 +1,119 @@
 #!/bin/bash
-# xp-bootdisk Safe Interactive USB Deployer
-# Requires root privileges to execute raw disk flashing and partitioning.
+# XP-Bootdisk safe interactive USB deployer.
 
-set -e
+set -Eeuo pipefail
 
-# Force root privileges
 if [ "$EUID" -ne 0 ]; then
-    echo "[!] Error: Please run this script with sudo or as root."
+    echo "[!] Run this script with sudo or as root."
     exit 1
 fi
+
+for cmd in lsblk awk grep dd parted partprobe sgdisk blockdev mkfs.exfat mount umount mountpoint sync; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+        echo "[!] Missing required command: $cmd"
+        exit 1
+    }
+done
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WIC_IMAGE="$PROJECT_ROOT/poky/build/tmp/deploy/images/qemux86-64/ramboot-image-qemux86-64.wic"
+WIC_IMAGE="${WIC_IMAGE:-$PROJECT_ROOT/poky/build/tmp/deploy/images/qemux86-64/ramboot-image-qemux86-64.rootfs.wic}"
 
-echo "=========================================="
-echo "      XP-BOOTDISK USB DEPLOYMENT TOOL     "
-echo "=========================================="
-
-# 1. Verify WIC image existence
 if [ ! -f "$WIC_IMAGE" ]; then
-    echo "[!] Error: Yocto build image not found at:"
+    echo "[!] Yocto WIC image not found:"
     echo "    $WIC_IMAGE"
-    echo "    Please run a build first (e.g. using ./setup.sh)."
+    echo "    Run ./setup.sh first, or set WIC_IMAGE to an explicit .wic file."
     exit 1
 fi
 
-echo "[+] Found build image: $(basename "$WIC_IMAGE")"
-echo ""
-
-# 2. Identify USB drives
-echo "[+] Scanning for connected USB storage drives..."
-echo "--------------------------------------------------"
-# Find block devices filtered by USB transport type or removable properties
-USB_DEVICES=$(lsblk -d -n -o NAME,SIZE,TRAN,RM | grep -E 'usb|1$' || true)
-
+echo "=========================================="
+echo "      XP-BOOTDISK USB DEPLOYMENT TOOL"
+echo "=========================================="
+echo "[+] Image: $WIC_IMAGE"
+echo
+echo "[+] USB disks detected:"
+USB_DEVICES="$(lsblk -dnpo NAME,SIZE,TRAN,RM,TYPE | awk '$3 == "usb" && $5 == "disk" {print}')"
 if [ -z "$USB_DEVICES" ]; then
-    echo "[!] Error: No USB storage drives detected."
-    echo "    Please plug in your target USB key and try again."
+    echo "[!] No whole-disk block device with TRAN=usb was detected."
+    exit 1
+fi
+printf '%s\n' "$USB_DEVICES"
+echo
+
+read -r -p "[?] Enter the complete target path (for example /dev/sdb): " TARGET_DEV
+if ! printf '%s\n' "$USB_DEVICES" | awk '{print $1}' | grep -Fxq -- "$TARGET_DEV"; then
+    echo "[!] $TARGET_DEV is not one of the USB disks listed above."
     exit 1
 fi
 
-# Print header and devices
-printf "%-10s %-10s %-10s\n" "DEVICE" "SIZE" "TYPE"
-echo "--------------------------------------------------"
-echo "$USB_DEVICES" | while read -r name size tran rm; do
-    printf "%-10s %-10s %-10s\n" "/dev/$name" "$size" "USB Key"
-done
-echo "--------------------------------------------------"
-echo ""
-
-# 3. Solicit target drive choice
-read -p "[?] Enter the target device name to flash (e.g. sdb, sdc): " TARGET_NAME
-TARGET_NAME=$(echo "$TARGET_NAME" | sed 's|^/dev/||')
-
-# Validate choice exists in usb list
-if ! echo "$USB_DEVICES" | grep -q "^$TARGET_NAME "; then
-    echo "[!] Error: Invalid selection '/dev/$TARGET_NAME'. Device is not in the USB list."
-    exit 1
-fi
-
-TARGET_DEV="/dev/$TARGET_NAME"
-echo ""
-echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-echo "WARNING: ALL DATA ON $TARGET_DEV WILL BE ERASED!"
-echo "This includes all partitions and filesystem structures."
-echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-read -p "[?] Are you absolutely sure you want to write to $TARGET_DEV? (type 'yes' to confirm): " CONFIRM
-
-if [ "$CONFIRM" != "yes" ]; then
-    echo "[-] Deployment aborted by user."
+echo
+echo "WARNING: ALL DATA ON $TARGET_DEV WILL BE ERASED."
+read -r -p "[?] Type the complete device path again to confirm: " CONFIRM
+if [ "$CONFIRM" != "$TARGET_DEV" ]; then
+    echo "[-] Confirmation did not match; deployment aborted."
     exit 0
 fi
 
-# 4. Unmount any active partitions on the target drive
-echo "[+] Unmounting any active partitions on $TARGET_DEV..."
-for part in ${TARGET_DEV}*; do
-    if mountpoint -q "$part" 2>/dev/null || grep -q "$part" /proc/mounts; then
-        echo "    Unmounting $part..."
-        umount -f "$part" || true
-    fi
+echo "[+] Unmounting mounted partitions on $TARGET_DEV..."
+mapfile -t MOUNTED_PARTS < <(lsblk -lnpo NAME,MOUNTPOINT "$TARGET_DEV" | awk 'NR > 1 && $2 != "" {print $1}')
+for ((i=${#MOUNTED_PARTS[@]}-1; i>=0; i--)); do
+    umount "${MOUNTED_PARTS[$i]}"
 done
 
-# 5. Burn WIC Image
-echo "[+] Flashing Yocto OS partitions to $TARGET_DEV..."
+echo "[+] Writing the GPT/UEFI host image..."
 dd if="$WIC_IMAGE" of="$TARGET_DEV" bs=4M status=progress conv=fsync
-echo "[+] OS flashing complete."
-
-# 6. Re-scan partition table
 partprobe "$TARGET_DEV" || true
-sleep 1
-
-# 7. Create payloads & isos data partition
-echo "[+] Provisioning secondary data partition on remaining USB space..."
-# Create a primary partition starting at 3GB (after OS partitions) extending to 100%
-parted -s "$TARGET_DEV" mkpart primary exfat 3GiB 100%
+sgdisk -e "$TARGET_DEV"
 partprobe "$TARGET_DEV" || true
-sleep 1
 
-# Format as exFAT
-PART_DATA="${TARGET_DEV}2"
-# Handle NVMe style partition naming (e.g. nvme0n1p2) if USB identifies as nvme (rare but possible)
-if [[ "$TARGET_DEV" =~ nvme || "$TARGET_DEV" =~ mmcblk ]]; then
-    PART_DATA="${TARGET_DEV}p2"
+LAST_END="$(parted -m "$TARGET_DEV" unit s print | awk -F: '/^[0-9]+:/{gsub(/s/, "", $3); if ($3 > max) max=$3} END{print max+0}')"
+DISK_SECTORS="$(blockdev --getsz "$TARGET_DEV")"
+DATA_START=$((LAST_END + 2048))
+if [ $((DISK_SECTORS - DATA_START)) -lt 2097152 ]; then
+    echo "[!] Less than 1 GiB remains for XP-BOOTDATA; use a larger USB disk."
+    exit 1
 fi
 
-echo "[+] Formatting $PART_DATA partition as exFAT (Label: XP-BOOTDATA)..."
-mkfs.exfat -L "XP-BOOTDATA" "$PART_DATA"
+echo "[+] Creating XP-BOOTDATA after sector $LAST_END..."
+parted -s "$TARGET_DEV" unit s mkpart XP-BOOTDATA exfat "${DATA_START}s" 100%
+partprobe "$TARGET_DEV" || true
 
-# 8. Create folder structure on data partition
-echo "[+] Creating /payloads and /isos directory structures..."
-MNT_DIR="/tmp/mnt_xp_usb"
-mkdir -p "$MNT_DIR"
-
-if mount "$PART_DATA" "$MNT_DIR" 2>/dev/null; then
-    mkdir -p "$MNT_DIR/payloads" "$MNT_DIR/isos"
-    echo "    Success: folders '/payloads' and '/isos' created."
-    umount "$MNT_DIR"
+DATA_NUM="$(parted -m "$TARGET_DEV" unit s print | awk -F: '/^[0-9]+:/{if ($1 > max) max=$1} END{print max+0}')"
+if [[ "$TARGET_DEV" =~ [0-9]$ ]]; then
+    PART_DATA="${TARGET_DEV}p${DATA_NUM}"
 else
-    echo "[!] Warning: Could not auto-mount $PART_DATA to create directories."
-    echo "    Please mount the partition manually and create /payloads and /isos."
+    PART_DATA="${TARGET_DEV}${DATA_NUM}"
 fi
 
-rm -rf "$MNT_DIR"
-echo ""
+for _ in {1..20}; do
+    [ -b "$PART_DATA" ] && break
+    sleep 0.25
+done
+if [ ! -b "$PART_DATA" ]; then
+    echo "[!] The new partition device did not appear: $PART_DATA"
+    exit 1
+fi
+
+echo "[+] Formatting $PART_DATA as exFAT..."
+mkfs.exfat -L XP-BOOTDATA "$PART_DATA"
+
+MNT_DIR="$(mktemp -d /tmp/xp-bootdata.XXXXXX)"
+cleanup() {
+    if mountpoint -q "$MNT_DIR"; then
+        umount "$MNT_DIR" || true
+    fi
+    rmdir "$MNT_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+mount "$PART_DATA" "$MNT_DIR"
+mkdir -p "$MNT_DIR/payloads" "$MNT_DIR/isos"
+sync
+umount "$MNT_DIR"
+rmdir "$MNT_DIR"
+trap - EXIT
+
+echo
 echo "=========================================="
-echo "SUCCESS: xp-bootdisk has been deployed!"
-echo "You can now copy OS payloads or ISOs to the USB data partition."
+echo "SUCCESS: XP-Bootdisk was deployed."
+echo "Data partition: $PART_DATA (XP-BOOTDATA)"
 echo "=========================================="

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Seamless QEMU Payload Extractor & Launcher with Auto-Persist & Bridging
 
-set -e
+set -Eeo pipefail
 
 # Hide terminal cursor
 setterm -cursor off 2>/dev/null || true
@@ -9,7 +9,7 @@ setterm -cursor off 2>/dev/null || true
 PAYLOAD_DIR="/media/usb/payloads"
 ISO_DIR="/media/usb/isos"
 RAMDISK="/mnt/ramdisk"
-SWTPM_DIR="/tmp/swtpm"
+SWTPM_DIR="$RAMDISK/state/swtpm"
 OVMF_CODE="/usr/share/ovmf/OVMF_CODE.fd"
 OVMF_VARS_TEMPLATE="/usr/share/ovmf/OVMF_VARS.fd"
 
@@ -23,7 +23,50 @@ MACOS_HDD="$RAMDISK/mac_hdd_ng.qcow2"
 # Apple SMC key (required for macOS boot — from OSX-KVM project)
 APPLE_OSK="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
 
-mkdir -p "$RAMDISK" "$ISO_DIR"
+SERVER_PID=""
+SWTPM_PID=""
+QEMU_STATUS=0
+REMOTE_PERSIST=0
+
+cleanup() {
+    if [ -n "$SWTPM_PID" ]; then
+        kill "$SWTPM_PID" 2>/dev/null || true
+    fi
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+    fi
+    if mountpoint -q "$RAMDISK"; then
+        umount "$RAMDISK" 2>/dev/null || true
+    fi
+    setterm -cursor on 2>/dev/null || true
+}
+
+persist_payload() {
+    local destination="$1"
+    shift
+    local temporary="${destination}.tmp.$$"
+
+    rm -f "$temporary"
+    if tar --sparse -cJf "$temporary" -C "$RAMDISK" "$@"; then
+        sync
+        mv -f "$temporary" "$destination"
+        sync
+    else
+        rm -f "$temporary"
+        echo "[!] Persistence failed; the previous payload was left unchanged."
+        return 1
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+if ! mountpoint -q /media/usb; then
+    echo "[!] XP-BOOTDATA is not mounted at /media/usb."
+    echo "    Check: systemctl status media-usb.mount"
+    exit 1
+fi
+
+mkdir -p "$RAMDISK" "$ISO_DIR" "$PAYLOAD_DIR"
 
 # Mount tmpfs using 80% of host RAM
 if ! mountpoint -q "$RAMDISK"; then
@@ -33,7 +76,18 @@ fi
 # Clean up old trigger files & sockets
 rm -f /tmp/auto_persist /tmp/qemu-monitor.sock
 
-# Start background persist HTTP server
+# The token is generated once on XP-BOOTDATA. Requests are accepted only on
+# the private bridge address and require an Authorization: Bearer header.
+TOKEN_FILE="/media/usb/persist.token"
+if [ ! -s "$TOKEN_FILE" ]; then
+    umask 077
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$TOKEN_FILE"
+    sync
+fi
+PERSIST_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+export PERSIST_TOKEN
+export PERSIST_BIND_ADDRESS="192.168.254.1"
+
 if [ -f "/usr/bin/persist-server" ]; then
     /usr/bin/persist-server &
     SERVER_PID=$!
@@ -68,10 +122,13 @@ CPU_EXTRA_FLAGS=""
 
 if dialog --backtitle "HARDWARE PASSTHROUGH" --yesno "Would you like to pass through a physical GPU (AMD/NVIDIA) to the guest VM?" 7 60; then
     clear
-    source /usr/bin/bind-gpu
-    if [ -n "$PASSTHROUGH_CMD_ARGS" ]; then
-        GPU_PASSTHROUGH_ARGS="-nographic -display none $PASSTHROUGH_CMD_ARGS"
-        CPU_EXTRA_FLAGS="$GPU_CPU_FLAGS"
+    if source /usr/bin/bind-gpu; then
+        if [ -n "$PASSTHROUGH_CMD_ARGS" ]; then
+            GPU_PASSTHROUGH_ARGS="-nographic -display none $PASSTHROUGH_CMD_ARGS"
+            CPU_EXTRA_FLAGS="$GPU_CPU_FLAGS"
+        fi
+    else
+        dialog --title "GPU Passthrough Unavailable" --msgbox "The selected GPU could not be isolated safely. Continuing with a virtual display." 7 68
     fi
 fi
 
@@ -107,7 +164,9 @@ case $CHOICE in
         sleep 1
         
         echo "[+] Preparing UEFI storage..."
-        cp "$OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS.fd"
+        if [ ! -f "$RAMDISK/OVMF_VARS.fd" ]; then
+            cp "$OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS.fd"
+        fi
         
         # Build CPU arguments cleanly
         if [ -n "$CPU_EXTRA_FLAGS" ]; then
@@ -129,9 +188,10 @@ case $CHOICE in
             -drive file="$IMG",format=qcow2,if=virtio,aio=io_uring \
             $NET_ARGS \
             $MONITOR_ARGS \
-            $GPU_PASSTHROUGH_ARGS
+            $GPU_PASSTHROUGH_ARGS || QEMU_STATUS=$?
             
         kill $SWTPM_PID 2>/dev/null || true
+        SWTPM_PID=""
         ;;
         
     2)
@@ -163,7 +223,7 @@ case $CHOICE in
             -drive file="$IMG",format=raw,if=virtio,aio=io_uring \
             $NET_ARGS \
             $MONITOR_ARGS \
-            $GPU_PASSTHROUGH_ARGS
+            $GPU_PASSTHROUGH_ARGS || QEMU_STATUS=$?
         ;;
 
     3)
@@ -182,8 +242,8 @@ case $CHOICE in
         # Ensure KVM MSR ignore is set (required for macOS)
         echo 1 > /sys/module/kvm/parameters/ignore_msrs 2>/dev/null || true
 
-        echo "[+] Preparing macOS OVMF NVRAM (writable copy)..."
-        cp "$MACOS_OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS-macos-run.fd"
+        echo "[+] Using persistent macOS OVMF NVRAM..."
+        test -f "$MACOS_OVMF_VARS_TEMPLATE"
 
         # macOS must use Haswell-noTSX (AVX2) with Intel vendor spoof
         MAC_CPU_ARGS="Haswell-noTSX,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,check"
@@ -209,7 +269,7 @@ case $CHOICE in
             -device usb-tablet,bus=xhci.0 \
             -device isa-applesmc,osk="$APPLE_OSK" \
             -drive if=pflash,format=raw,readonly=on,file="$MACOS_OVMF_CODE" \
-            -drive if=pflash,format=raw,file="$RAMDISK/OVMF_VARS-macos-run.fd" \
+            -drive if=pflash,format=raw,file="$MACOS_OVMF_VARS_TEMPLATE" \
             -smbios type=2 \
             -device ich9-intel-hda \
             -device hda-duplex \
@@ -222,7 +282,7 @@ case $CHOICE in
             -device ide-hd,bus=sata.4,drive=MacHDD \
             $MAC_NET_ARGS \
             $MONITOR_ARGS \
-            $MAC_GPU_ARGS
+            $MAC_GPU_ARGS || QEMU_STATUS=$?
         ;;
 
     4)
@@ -277,7 +337,9 @@ case $CHOICE in
         fi
         
         echo "[+] Preparing UEFI storage..."
-        cp "$OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS.fd"
+        if [ ! -f "$RAMDISK/OVMF_VARS.fd" ]; then
+            cp "$OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS.fd"
+        fi
         
         echo "[+] Booting $SELECTED_ISO in QEMU..."
         qemu-system-x86_64 \
@@ -291,11 +353,13 @@ case $CHOICE in
             $ATTACH_DISK \
             $NET_ARGS \
             $MONITOR_ARGS \
-            $GPU_PASSTHROUGH_ARGS
+            $GPU_PASSTHROUGH_ARGS || QEMU_STATUS=$?
         ;;
 esac
 
-# Reassign ISO Ventoy to case 4 (menu item renumbered from 3 to 4)
+if [ "$QEMU_STATUS" -ne 0 ]; then
+    echo "[!] QEMU exited with status $QEMU_STATUS. Cleanup will still run."
+fi
 
 # Kill HTTP server daemon
 if [ -n "$SERVER_PID" ]; then
@@ -305,6 +369,7 @@ fi
 # Determine whether to save changes
 RUN_PERSIST=0
 if [ -f "/tmp/auto_persist" ]; then
+    REMOTE_PERSIST=1
     RUN_PERSIST=1
     rm -f "/tmp/auto_persist"
     echo "[+] Auto-persist triggered by guest VM."
@@ -321,17 +386,15 @@ if [ "$RUN_PERSIST" -eq 1 ]; then
     case $CHOICE in
         1)
             echo "[+] Compressing Windows 11 image back to USB payloads (this may take a few minutes)..."
-            tar -cJf "$PAYLOAD_DIR/win11.tar.xz" -C "$RAMDISK" win11.qcow2
+            persist_payload "$PAYLOAD_DIR/win11.tar.xz" win11.qcow2 OVMF_VARS.fd state/swtpm
             ;;
         2)
             echo "[+] Compressing Linux image back to USB payloads (this may take a few minutes)..."
-            tar -cJf "$PAYLOAD_DIR/linux.tar.xz" -C "$RAMDISK" linux.img
+            persist_payload "$PAYLOAD_DIR/linux.tar.xz" linux.img
             ;;
         3)
             echo "[+] Compressing macOS HDD image back to USB payloads (this may take several minutes)..."
-            # Repackage all macOS components back — preserves OpenCore EFI and OVMF changes
-            tar -cJf "$PAYLOAD_DIR/macos.tar.xz" \
-                -C "$RAMDISK" \
+            persist_payload "$PAYLOAD_DIR/macos.tar.xz" \
                 mac_hdd_ng.qcow2 \
                 BaseSystem.img \
                 opencore/ \
@@ -340,7 +403,7 @@ if [ "$RUN_PERSIST" -eq 1 ]; then
         4)
             if [ -f "$RAMDISK/temp_target.qcow2" ]; then
                 echo "[+] Compressing Virtual Ventoy installation disk back to USB payloads..."
-                tar -cJf "$PAYLOAD_DIR/ventoy_install.tar.xz" -C "$RAMDISK" temp_target.qcow2
+                persist_payload "$PAYLOAD_DIR/ventoy_install.tar.xz" temp_target.qcow2
             fi
             ;;
     esac
@@ -350,4 +413,11 @@ fi
 
 echo "[+] Cleaning up RAM disk..."
 umount "$RAMDISK" || true
+trap - EXIT INT TERM
 setterm -cursor on 2>/dev/null || true
+
+if [ "$REMOTE_PERSIST" -eq 1 ]; then
+    echo "[+] Remote persistence completed; powering off the host."
+    sync
+    systemctl poweroff
+fi

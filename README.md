@@ -1,8 +1,8 @@
 # XP-Bootdisk — Yocto QEMU RAM Booter
 
-A custom Yocto Project layer (`meta-ramboot`) that builds a **live USB boot disk**. Boot it on any x86-64 machine with a compatible GPU, and it launches a minimal Linux host entirely from RAM — then runs a full guest OS (Windows 11 or Linux) inside QEMU with near-native performance via KVM and GPU PCI passthrough.
+A custom Yocto Project layer (`meta-ramboot`) that builds a **GPT/UEFI USB boot disk**. It launches a minimal Linux host from the USB and extracts a selected guest disk into tmpfs before running it with QEMU/KVM.
 
-> **No install. No trace. Full hardware.** The host OS lives in RAM; the USB never mounts as writable on the host.
+> **No installation to the computer's internal disks.** The host root filesystem and the explicitly persisted guest payload are writable on the USB.
 
 ---
 
@@ -10,8 +10,8 @@ A custom Yocto Project layer (`meta-ramboot`) that builds a **live USB boot disk
 
 | Feature | Description |
 |---------|-------------|
-| 🧠 **Boots entirely in RAM** | The full host OS decompresses from a `.tar.xz` payload on the USB into `tmpfs` at boot — no HDD required |
-| 🎮 **Dynamic GPU Passthrough** | Automatically detects and isolates AMD or NVIDIA GPUs using VFIO at boot, before any driver claims them |
+| 🧠 **RAM-backed guest disk** | The selected guest payload decompresses into `tmpfs`; the Yocto host itself runs from the USB |
+| 🎮 **Guarded GPU Passthrough** | Detects non-primary AMD or NVIDIA GPUs and permits passthrough only when their complete IOMMU group is isolated |
 | 🕶️ **Hypervisor Stealth** | Hides KVM signature from NVIDIA drivers (`kvm=off`, `hv_vendor_id=null`) to prevent Code 43 errors |
 | 💻 **Windows 11 + Linux Support** | Boots prebuilt `.qcow2` or raw image guests stored as compressed tarballs on the USB data partition |
 | 🍎 **macOS Support** | Boots macOS Sonoma/Sequoia via OpenCore EFI with Intel CPU spoofing, Apple SMC emulation, and optional AMD GPU passthrough |
@@ -28,7 +28,7 @@ A custom Yocto Project layer (`meta-ramboot`) that builds a **live USB boot disk
 | Component | Requirement |
 |-----------|-------------|
 | **CPU** | x86-64 with KVM (`vmx`/`svm`) and IOMMU (`VT-d`/`AMD-Vi`) enabled in BIOS |
-| **RAM** | 32 GB minimum (16 GB for host OS in RAM + 16 GB for guest). 64 GB recommended for Windows 11 |
+| **RAM** | 32 GB minimum for the host, decompressed guest disk, and guest memory together. 64 GB recommended for Windows 11 |
 | **GPU** | Discrete AMD (RDNA2+) or NVIDIA (Pascal+) in its own IOMMU group |
 | **USB Drive** | USB 3.0+, 32 GB minimum. USB 3.1 Gen 2 or NVMe in USB enclosure recommended |
 | **Firmware** | UEFI firmware. Secure Boot must be **disabled** |
@@ -43,13 +43,13 @@ A custom Yocto Project layer (`meta-ramboot`) that builds a **live USB boot disk
 Use the included `setup.sh` to handle the full environment setup automatically:
 
 ```bash
-# 1. Clone Poky and dependencies into the same parent directory
+# 1. Clone Poky, then clone its dependency layers inside poky/
 git clone -b scarthgap git://git.yoctoproject.org/poky
 cd poky
 git clone -b scarthgap git://git.openembedded.org/meta-openembedded
 git clone -b scarthgap https://git.yoctoproject.org/meta-security
 
-# 2. Clone this repository at the same level as poky/
+# 2. Clone this repository beside poky/ (setup.sh also supports repo/poky/)
 cd ..
 git clone https://github.com/expeeee/xp-bootdisk.git
 
@@ -59,8 +59,9 @@ cd xp-bootdisk
 ```
 
 `setup.sh` will:
-- Verify Poky is present and create the required compatibility symlink
-- Initialize the BitBake build environment
+- Locate Poky either beside or inside the repository
+- Add and validate every required layer
+- Install an idempotent production `local.conf` block
 - Start `bitbake ramboot-image` automatically
 
 ---
@@ -117,11 +118,11 @@ xp-bootdisk/
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Yocto Linux Host (in RAM — tmpfs)                          │
+│  Yocto Linux Host (USB root; guest disk in tmpfs)           │
 │                                                              │
-│  1. Systemd starts qemu-booter.sh on tty1                   │
-│  2. User selects: OS payload, ISO boot, or GPU passthrough  │
-│  3. bind-gpu.sh scans PCI bus, isolates GPU → vfio-pci      │
+│  1. Systemd mounts XP-BOOTDATA at /media/usb                │
+│  2. qemu-booter.sh starts on tty1                           │
+│  3. User selects an OS/ISO and optional isolated GPU        │
 │  4. Payload .tar.xz decompresses into /tmp/guest/ (RAM)     │
 │  5. persist-server.py starts on 192.168.254.1:8000          │
 │  6. QEMU launches with KVM + VFIO + TAP networking          │
@@ -172,9 +173,9 @@ When QEMU exits, the launcher prompts:
 Selecting `y` re-compresses the RAM disk back into `.tar.xz` and writes it to the USB.
 
 ### Option 2 — Remote web trigger (headless)
-From inside the guest OS, simply access:
+Read `persist.token` from the root of XP-BOOTDATA, then make an authenticated request:
 ```
-http://192.168.254.1:8000/persist
+curl -X POST -H "Authorization: Bearer TOKEN" http://192.168.254.1:8000/persist
 ```
 This instructs the host daemon (`persist-server.py`) to:
 1. Send an ACPI shutdown (`system_powerdown`) via the QEMU monitor socket
@@ -212,7 +213,7 @@ Use the included `deploy.sh` script to safely flash and prepare a USB drive:
 The script will:
 1. List all attached USB block devices (never shows internal drives)
 2. Prompt for confirmation before any write
-3. Flash `ramboot-image-qemux86-64.rootfs.wic.gz` to Partition 1
+3. Flash `ramboot-image-qemux86-64.rootfs.wic` as a GPT/UEFI disk image
 4. Format the remaining space as **exFAT** (label: `XP-BOOTDATA`)
 5. Create `/payloads/` and `/isos/` directories on the data partition
 
@@ -246,8 +247,9 @@ See [`docs/macos-setup.md`](file:///x:/AI/devel/Yocto-bootdisk/docs/macos-setup.
 
 - **Secure Boot must be disabled** — the kernel is unsigned
 - **IOMMU group isolation** — the GPU must be in its own IOMMU group. Shared groups (ACS issue) require BIOS/motherboard workarounds
+- **Second GPU required for dynamic binding** — the launcher refuses to detach the firmware/host-console GPU
 - **Wi-Fi bridging not supported** — the transparent bridge requires a wired Ethernet interface
-- **Single GPU passthrough** — one discrete GPU is passed to the guest; the host console uses only framebuffer or a second GPU
+- **Host root is not RAM-resident** — the guest disk is RAM-backed, while the Yocto root filesystem remains on USB
 - **USB 3.0+ strongly recommended** — USB 2.0 drives will be too slow for decompressing payloads into RAM
 - **No Wayland on host** — the host is a minimal console-only environment (by design)
 - **macOS: AMD GPU only** — NVIDIA support was dropped by Apple after High Sierra; only AMD RX/Vega/Pro GPUs work natively in macOS Sonoma/Sequoia

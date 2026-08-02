@@ -10,7 +10,7 @@ The following diagram illustrates how the host system acts as a transparent, hig
 
 ```
 +-------------------------------------------------------------------+
-|                        USB Drive / Live OS                        |
+|                    GPT/UEFI USB Host Disk                         |
 |                                                                   |
 | +---------------------------------------------------------------+ |
 | | Yocto Linux Host (Minimal Kernel + QEMU + KVM + Systemd)      | |
@@ -25,8 +25,8 @@ The following diagram illustrates how the host system acts as a transparent, hig
 +-------------------------------------------------------------------+
 | 1. Systemd starts custom launcher script on tty1                  |
 | 2. Script queries user to choose OS via interactive dialog        |
-| 3. User is asked if they want to pass through a GPU (AMD/NVIDIA)  |
-| 4. Selected GPU is isolated and bound dynamically to vfio-pci     |
+| 3. User may select a non-primary AMD/NVIDIA GPU                   |
+| 4. The complete isolated IOMMU group is bound to vfio-pci         |
 | 5. tmpfs is mounted in RAM; guest payload decompresses into it    |
 | 6. QEMU launches guest using host hardware acceleration (KVM/VFIO)|
 +-------------------------------------------------------------------+
@@ -96,13 +96,13 @@ To ensure near-native performance and bypass driver lockups or VM checks:
    bitbake ramboot-image
    ```
 7. **Write to USB:**
-   Flash the `.wic` file output to your target USB drive:
+   Use the guarded deployer, which flashes the UEFI WIC and creates XP-BOOTDATA:
    ```bash
-   sudo dd if=tmp/deploy/images/qemux86-64/ramboot-image-qemux86-64.wic of=/dev/sdX bs=4M status=progress
+   sudo ./deploy.sh
    ```
 
 ### USB Payload Setup
-Create a second partition on the USB drive (or use an external USB drive) mounted at `/media/usb` with `/payloads` and `/isos` folders:
+`deploy.sh` appends an exFAT partition labeled `XP-BOOTDATA`. The booted host mounts it at `/media/usb` before starting the launcher:
 
 *   **/media/usb/payloads/** — Place pre-built system archives here:
     *   `win11.tar.xz` (containing `win11.qcow2` to run Windows 11 LTSC)
@@ -136,7 +136,8 @@ When you shut down the guest OS cleanly from the OS menu:
 
 ### 2. Remote / Web Trigger
 If you run the VM headlessly, or want to trigger the persist operation remotely:
-1. Enter the guest VM and browse or fetch the URL: `http://192.168.254.1:8000/persist`
-2. The host's background server receives the trigger, schedules a state backup, and sends a safe ACPI shutdown command (`system_powerdown`) to the VM.
-3. The guest OS flushes file writes and exits cleanly.
-4. The host intercepts the exit, compresses the RAM disk image back to the USB payloads folder, and powers down the physical machine automatically.
+1. Read `persist.token` from the root of `XP-BOOTDATA`.
+2. Send `POST /persist` with `Authorization: Bearer TOKEN` to `192.168.254.1:8000`.
+3. The host validates the token, schedules a state backup, and sends `system_powerdown` to the VM.
+4. The guest OS flushes file writes and exits cleanly.
+5. The host writes a temporary sparse-aware archive, atomically replaces the payload, and powers down only after persistence succeeds.

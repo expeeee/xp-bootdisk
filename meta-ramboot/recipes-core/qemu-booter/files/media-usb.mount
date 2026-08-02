@@ -1,0 +1,14 @@
+[Unit]
+Description=XP-Bootdisk payload storage
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Mount]
+What=/dev/disk/by-label/XP-BOOTDATA
+Where=/media/usb
+Type=exfat
+Options=rw,nosuid,nodev,noexec
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target
