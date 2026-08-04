@@ -100,6 +100,56 @@ load_payload() {
     fi
 }
 
+# run_qemu NAME [QEMU_ARGS...]
+#
+#   Executes qemu-system-x86_64 with sidecar customisation support.
+#   Sidecar files are read from $PAYLOAD_DIR and checked in this order:
+#
+#   1. $PAYLOAD_DIR/NAME.qemu.sh   — full override script
+#        Sourced directly with all launcher variables already exported:
+#          $IMG $RAMDISK $NET_ARGS $MONITOR_ARGS $GPU_PASSTHROUGH_ARGS $CPU_ARGS
+#        The script is responsible for calling qemu-system-x86_64 itself.
+#        Exit code is captured in $QEMU_STATUS.
+#
+#   2. $PAYLOAD_DIR/NAME.qemu.args — extra args appended to the standard launch
+#        One argument per line (blank lines and # comments ignored).
+#        These are appended AFTER all standard args but BEFORE the display args.
+#        Example /payloads/win11.qemu.args:
+#          -m 32G
+#          -smp 16,sockets=1,cores=8,threads=2
+#          -device usb-host,vendorid=0x1234,productid=0x5678
+#
+#   3. (none) — standard hardcoded args are used as-is
+#
+run_qemu() {
+    local name="$1"
+    shift
+    local std_args=("$@")
+
+    local override_sh="$PAYLOAD_DIR/${name}.qemu.sh"
+    local extra_args_file="$PAYLOAD_DIR/${name}.qemu.args"
+
+    if [ -f "$override_sh" ]; then
+        echo "[+] Custom QEMU override found: ${name}.qemu.sh"
+        # shellcheck disable=SC1090
+        source "$override_sh"
+        return
+    fi
+
+    # Build extra args array from sidecar .args file (skip blank lines and comments)
+    local extra_args=()
+    if [ -f "$extra_args_file" ]; then
+        echo "[+] Appending custom args from ${name}.qemu.args"
+        while IFS= read -r line || [ -n "$line" ]; do
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue   # skip blank
+            [[ "$line" =~ ^[[:space:]]*# ]]  && continue   # skip comments
+            extra_args+=("$line")
+        done < "$extra_args_file"
+    fi
+
+    qemu-system-x86_64 "${std_args[@]}" "${extra_args[@]}" || QEMU_STATUS=$?
+}
+
 trap cleanup EXIT INT TERM
 
 if ! mountpoint -q /media/usb; then
@@ -216,7 +266,7 @@ case $CHOICE in
         fi
 
         echo "[+] Booting Windows 11 in RAM..."
-        qemu-system-x86_64 \
+        run_qemu "win11" \
             -enable-kvm -machine q35,accel=kvm \
             -m 16G -smp 8,sockets=1,cores=4,threads=2 \
             -cpu "$CPU_ARGS" \
@@ -228,7 +278,7 @@ case $CHOICE in
             -drive file="$IMG",format=qcow2,if=virtio,aio=io_uring \
             $NET_ARGS \
             $MONITOR_ARGS \
-            $GPU_PASSTHROUGH_ARGS || QEMU_STATUS=$?
+            $GPU_PASSTHROUGH_ARGS
 
         kill $SWTPM_PID 2>/dev/null || true
         SWTPM_PID=""
@@ -262,14 +312,14 @@ case $CHOICE in
         fi
 
         echo "[+] Booting Linux VM..."
-        qemu-system-x86_64 \
+        run_qemu "linux" \
             -enable-kvm -machine q35,accel=kvm \
             -m 16G -smp 8 \
             -cpu "$CPU_ARGS" \
             -drive file="$IMG",format="$LINUX_FMT",if=virtio,aio=io_uring \
             $NET_ARGS \
             $MONITOR_ARGS \
-            $GPU_PASSTHROUGH_ARGS || QEMU_STATUS=$?
+            $GPU_PASSTHROUGH_ARGS
         ;;
 
     3)
@@ -313,7 +363,7 @@ case $CHOICE in
         fi
 
         echo "[+] Booting macOS in RAM via OpenCore..."
-        qemu-system-x86_64 \
+        run_qemu "macos" \
             -enable-kvm \
             -m 8G \
             -cpu "$MAC_CPU_ARGS" \
@@ -338,7 +388,7 @@ case $CHOICE in
             -device ide-hd,bus=sata.4,drive=MacHDD \
             $MAC_NET_ARGS \
             $MONITOR_ARGS \
-            $MAC_GPU_ARGS || QEMU_STATUS=$?
+            $MAC_GPU_ARGS
         ;;
 
     4)
