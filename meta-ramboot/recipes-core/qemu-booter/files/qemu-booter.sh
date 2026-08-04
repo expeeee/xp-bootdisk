@@ -58,6 +58,48 @@ persist_payload() {
     fi
 }
 
+# load_payload NAME DEST_FILENAME
+#   Supports three payload formats, tried in order:
+#     /payloads/NAME.tar.xz  — compressed archive  (extracted into ramdisk)
+#     /payloads/NAME.qcow2   — bare QCOW2 image    (symlinked into ramdisk)
+#     /payloads/NAME.img     — bare raw image       (symlinked into ramdisk)
+#
+#   After a successful call:
+#     PAYLOAD_FILE   = full path of the image inside RAMDISK
+#     PAYLOAD_FORMAT = "archive" | "qcow2" | "raw"
+load_payload() {
+    local name="$1"       # e.g. "win11"
+    local dest="$2"       # e.g. "win11.qcow2"  (filename expected inside ramdisk)
+
+    local archive="$PAYLOAD_DIR/${name}.tar.xz"
+    local bare_qcow2="$PAYLOAD_DIR/${name}.qcow2"
+    local bare_img="$PAYLOAD_DIR/${name}.img"
+
+    if [ -f "$archive" ]; then
+        echo "[+] Loading ${name} from compressed archive (.tar.xz)..."
+        tar -xJf "$archive" -C "$RAMDISK"
+        PAYLOAD_FORMAT="archive"
+        PAYLOAD_FILE="$RAMDISK/${dest}"
+    elif [ -f "$bare_qcow2" ]; then
+        echo "[+] Loading ${name} from bare qcow2 image (no decompression needed)..."
+        ln -sf "$bare_qcow2" "$RAMDISK/${dest}"
+        PAYLOAD_FORMAT="qcow2"
+        PAYLOAD_FILE="$RAMDISK/${dest}"
+    elif [ -f "$bare_img" ]; then
+        echo "[+] Loading ${name} from bare raw image (no decompression needed)..."
+        ln -sf "$bare_img" "$RAMDISK/${dest}"
+        PAYLOAD_FORMAT="raw"
+        PAYLOAD_FILE="$RAMDISK/${dest}"
+    else
+        echo "[!] No payload found for '${name}'."
+        echo "    Tried:"
+        echo "      $archive"
+        echo "      $bare_qcow2"
+        echo "      $bare_img"
+        return 1
+    fi
+}
+
 trap cleanup EXIT INT TERM
 
 if ! mountpoint -q /media/usb; then
@@ -142,19 +184,17 @@ MONITOR_ARGS="-monitor unix:/tmp/qemu-monitor.sock,server,nowait"
 
 case $CHOICE in
     1)
-        ARCHIVE="$PAYLOAD_DIR/win11.tar.xz"
-        IMG="$RAMDISK/win11.qcow2"
-        
-        if [ ! -f "$ARCHIVE" ]; then
-            echo "[!] Error: Win11 payload not found at $ARCHIVE"
-            read -p "Press Enter to return..."
-            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
+        # ── Windows 11 ──────────────────────────────────────────────────────────
+        # Supports: win11.tar.xz (compressed) OR win11.qcow2 (bare image)
+        PAYLOAD_FILE=""; PAYLOAD_FORMAT=""
+        if ! load_payload "win11" "win11.qcow2"; then
+            dialog --title "Payload Missing" --msgbox \
+                "Windows 11 payload not found.\n\nPlace one of these on the USB XP-BOOTDATA partition:\n  /payloads/win11.tar.xz  (compressed archive)\n  /payloads/win11.qcow2   (bare QCOW2 image)" \
+                10 65
             exit 1
         fi
-        
-        echo "[+] Decompressing Windows 11 payload into RAM disk..."
-        tar -xJf "$ARCHIVE" -C "$RAMDISK"
-        
+        IMG="$PAYLOAD_FILE"
+
         echo "[+] Initializing software TPM 2.0 interface..."
         mkdir -p "$SWTPM_DIR"
         swtpm socket --tpmstate dir="$SWTPM_DIR" \
@@ -162,19 +202,19 @@ case $CHOICE in
                      --tpm2 &
         SWTPM_PID=$!
         sleep 1
-        
+
         echo "[+] Preparing UEFI storage..."
         if [ ! -f "$RAMDISK/OVMF_VARS.fd" ]; then
             cp "$OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS.fd"
         fi
-        
+
         # Build CPU arguments cleanly
         if [ -n "$CPU_EXTRA_FLAGS" ]; then
             CPU_ARGS="host,${CPU_EXTRA_FLAGS},hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_synic,hv_stimer"
         else
             CPU_ARGS="host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_synic,hv_stimer"
         fi
-        
+
         echo "[+] Booting Windows 11 in RAM..."
         qemu-system-x86_64 \
             -enable-kvm -machine q35,accel=kvm \
@@ -189,55 +229,71 @@ case $CHOICE in
             $NET_ARGS \
             $MONITOR_ARGS \
             $GPU_PASSTHROUGH_ARGS || QEMU_STATUS=$?
-            
+
         kill $SWTPM_PID 2>/dev/null || true
         SWTPM_PID=""
         ;;
-        
+
     2)
-        ARCHIVE="$PAYLOAD_DIR/linux.tar.xz"
-        IMG="$RAMDISK/linux.img"
-        
-        if [ ! -f "$ARCHIVE" ]; then
-            echo "[!] Error: Linux payload not found at $ARCHIVE"
-            read -p "Press Enter to return..."
-            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
+        # ── Linux ───────────────────────────────────────────────────────────────
+        # Supports: linux.tar.xz (compressed) OR linux.qcow2 OR linux.img (bare)
+        PAYLOAD_FILE=""; PAYLOAD_FORMAT=""
+        if ! load_payload "linux" "linux.qcow2" 2>/dev/null && \
+           ! load_payload "linux" "linux.img"; then
+            dialog --title "Payload Missing" --msgbox \
+                "Linux payload not found.\n\nPlace one of these on the USB XP-BOOTDATA partition:\n  /payloads/linux.tar.xz  (compressed archive)\n  /payloads/linux.qcow2   (bare QCOW2 image)\n  /payloads/linux.img     (bare raw image)" \
+                11 65
             exit 1
         fi
-        
-        echo "[+] Decompressing Linux payload into RAM disk..."
-        tar -xJf "$ARCHIVE" -C "$RAMDISK"
-        
-        # Build CPU arguments cleanly
+        IMG="$PAYLOAD_FILE"
+
+        # Auto-detect disk format
+        if [ "$PAYLOAD_FORMAT" = "qcow2" ] || [[ "$IMG" == *.qcow2 ]]; then
+            LINUX_FMT="qcow2"
+        else
+            LINUX_FMT="raw"
+        fi
+
+        # Build CPU arguments
         if [ -n "$CPU_EXTRA_FLAGS" ]; then
             CPU_ARGS="host,${CPU_EXTRA_FLAGS}"
         else
             CPU_ARGS="host"
         fi
-        
-        echo "[+] Booting Linux VM in RAM..."
+
+        echo "[+] Booting Linux VM..."
         qemu-system-x86_64 \
             -enable-kvm -machine q35,accel=kvm \
             -m 16G -smp 8 \
             -cpu "$CPU_ARGS" \
-            -drive file="$IMG",format=raw,if=virtio,aio=io_uring \
+            -drive file="$IMG",format="$LINUX_FMT",if=virtio,aio=io_uring \
             $NET_ARGS \
             $MONITOR_ARGS \
             $GPU_PASSTHROUGH_ARGS || QEMU_STATUS=$?
         ;;
 
     3)
-        # ── macOS via OpenCore ──────────────────────────────────────────────
+        # ── macOS via OpenCore ─────────────────────────────────────────────────
+        # Supports: macos.tar.xz (full archive)
+        #       OR: mac_hdd_ng.qcow2 + BaseSystem.img + opencore/ + ovmf/ (bare)
         ARCHIVE="$PAYLOAD_DIR/macos.tar.xz"
+        BARE_HDD="$PAYLOAD_DIR/mac_hdd_ng.qcow2"
 
-        if [ ! -f "$ARCHIVE" ]; then
-            dialog --title "Payload Missing" --msgbox "macOS payload not found at $ARCHIVE\n\nRun fetch-macos-payload.sh on a Linux machine to create it." 8 65
-            if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
+        if [ -f "$ARCHIVE" ]; then
+            echo "[+] Decompressing macOS payload into RAM disk..."
+            tar -xJf "$ARCHIVE" -C "$RAMDISK"
+        elif [ -f "$BARE_HDD" ]; then
+            echo "[+] Loading macOS from bare components (no decompression needed)..."
+            ln -sf "$BARE_HDD"                       "$RAMDISK/mac_hdd_ng.qcow2"
+            [ -f "$PAYLOAD_DIR/BaseSystem.img" ]     && ln -sf "$PAYLOAD_DIR/BaseSystem.img" "$RAMDISK/BaseSystem.img"
+            [ -d "$PAYLOAD_DIR/opencore" ]           && ln -sfn "$PAYLOAD_DIR/opencore"      "$RAMDISK/opencore"
+            [ -d "$PAYLOAD_DIR/ovmf" ]               && ln -sfn "$PAYLOAD_DIR/ovmf"          "$RAMDISK/ovmf"
+        else
+            dialog --title "Payload Missing" --msgbox \
+                "macOS payload not found.\n\nExpected one of:\n  /payloads/macos.tar.xz   (compressed archive)\n  /payloads/mac_hdd_ng.qcow2 + opencore/ + ovmf/ + BaseSystem.img\n\nRun ./fetch-macos-payload.sh to create it." \
+                12 65
             exit 1
         fi
-
-        echo "[+] Decompressing macOS payload into RAM disk..."
-        tar -xJf "$ARCHIVE" -C "$RAMDISK"
 
         # Ensure KVM MSR ignore is set (required for macOS)
         echo 1 > /sys/module/kvm/parameters/ignore_msrs 2>/dev/null || true
@@ -286,11 +342,11 @@ case $CHOICE in
         ;;
 
     4)
-        # Scan directory for ISOs
+        # ── Virtual Ventoy (ISO boot) ────────────────────────────────────────
         declare -a ISO_MENU
         declare -A ISO_MAP
         index=1
-        
+
         while read -r file_path; do
             if [ -n "$file_path" ]; then
                 file_name=$(basename "$file_path")
@@ -299,27 +355,27 @@ case $CHOICE in
                 index=$((index+1))
             fi
         done < <(find "$ISO_DIR" -maxdepth 1 -type f -name "*.iso" 2>/dev/null)
-        
+
         if [ ${#ISO_MENU[@]} -eq 0 ]; then
             dialog --title "No ISOs Found" --msgbox "Please place bootable .iso files in $ISO_DIR" 6 50
             if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
             exit 1
         fi
-        
+
         ISO_CHOICE=$(dialog --backtitle "VIRTUAL VENTOY" \
             --title " Select ISO to Boot " \
             --menu "Choose an installer/live ISO to boot:" 15 65 6 \
             "${ISO_MENU[@]}" \
             3>&1 1>&2 2>&3)
-            
+
         if [ -z "$ISO_CHOICE" ]; then
             echo "No ISO selected. Exiting..."
             if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
             exit 0
         fi
-        
+
         SELECTED_ISO="${ISO_MAP[$ISO_CHOICE]}"
-        
+
         # Ask if the user wants to attach a temporary virtual hard disk in RAM
         ATTACH_DISK=""
         if dialog --title "Virtual Disk" --yesno "Create a temporary 20GB virtual disk in RAM to install to?" 7 60; then
@@ -328,19 +384,19 @@ case $CHOICE in
             qemu-img create -f qcow2 "$TEMP_DISK" 20G
             ATTACH_DISK="-drive file=$TEMP_DISK,format=qcow2,if=virtio"
         fi
-        
-        # Build CPU arguments cleanly
+
+        # Build CPU arguments
         if [ -n "$CPU_EXTRA_FLAGS" ]; then
             CPU_ARGS="host,${CPU_EXTRA_FLAGS}"
         else
             CPU_ARGS="host"
         fi
-        
+
         echo "[+] Preparing UEFI storage..."
         if [ ! -f "$RAMDISK/OVMF_VARS.fd" ]; then
             cp "$OVMF_VARS_TEMPLATE" "$RAMDISK/OVMF_VARS.fd"
         fi
-        
+
         echo "[+] Booting $SELECTED_ISO in QEMU..."
         qemu-system-x86_64 \
             -enable-kvm -machine q35,accel=kvm \
@@ -375,7 +431,6 @@ if [ -f "/tmp/auto_persist" ]; then
     echo "[+] Auto-persist triggered by guest VM."
 else
     clear
-    # Check if console environment is present and query the user
     if dialog --backtitle "PERSIST CHANGES" --yesno "Would you like to compress and persist changes back to the USB drive?" 7 60; then
         RUN_PERSIST=1
     fi
@@ -385,20 +440,34 @@ if [ "$RUN_PERSIST" -eq 1 ]; then
     echo "[+] Persisting changes to USB drive... Please do not unplug the drive."
     case $CHOICE in
         1)
-            echo "[+] Compressing Windows 11 image back to USB payloads (this may take a few minutes)..."
-            persist_payload "$PAYLOAD_DIR/win11.tar.xz" win11.qcow2 OVMF_VARS.fd state/swtpm
+            if [ "${PAYLOAD_FORMAT:-archive}" = "archive" ]; then
+                echo "[+] Compressing Windows 11 image back to USB payloads..."
+                persist_payload "$PAYLOAD_DIR/win11.tar.xz" win11.qcow2 OVMF_VARS.fd state/swtpm
+            else
+                echo "[+] Bare qcow2 in use — writes went directly to USB, no re-compress needed."
+            fi
             ;;
         2)
-            echo "[+] Compressing Linux image back to USB payloads (this may take a few minutes)..."
-            persist_payload "$PAYLOAD_DIR/linux.tar.xz" linux.img
+            if [ "${PAYLOAD_FORMAT:-archive}" = "archive" ]; then
+                echo "[+] Compressing Linux image back to USB payloads..."
+                if [ -f "$RAMDISK/linux.qcow2" ]; then
+                    persist_payload "$PAYLOAD_DIR/linux.tar.xz" linux.qcow2
+                else
+                    persist_payload "$PAYLOAD_DIR/linux.tar.xz" linux.img
+                fi
+            else
+                echo "[+] Bare image in use — writes went directly to USB, no re-compress needed."
+            fi
             ;;
         3)
-            echo "[+] Compressing macOS HDD image back to USB payloads (this may take several minutes)..."
-            persist_payload "$PAYLOAD_DIR/macos.tar.xz" \
-                mac_hdd_ng.qcow2 \
-                BaseSystem.img \
-                opencore/ \
-                ovmf/
+            # Only repack if files are real ramdisk copies, not symlinks to USB
+            if [ -f "$RAMDISK/mac_hdd_ng.qcow2" ] && [ ! -L "$RAMDISK/mac_hdd_ng.qcow2" ]; then
+                echo "[+] Compressing macOS HDD image back to USB payloads (this may take several minutes)..."
+                persist_payload "$PAYLOAD_DIR/macos.tar.xz" \
+                    mac_hdd_ng.qcow2 BaseSystem.img opencore/ ovmf/
+            else
+                echo "[+] Bare components in use — writes went directly to USB, no re-compress needed."
+            fi
             ;;
         4)
             if [ -f "$RAMDISK/temp_target.qcow2" ]; then
